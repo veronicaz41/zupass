@@ -7,11 +7,13 @@ import {
   RedirectTopicDataPayload,
   getAnonTopicNullifier
 } from "@pcd/passport-interface";
+import { SerializedPCD } from "@pcd/pcd-types";
 import { ONE_HOUR_MS, bigintToPseudonym, isFulfilled, sleep } from "@pcd/util";
 import {
   ZKEdDSAEventTicketPCD,
   ZKEdDSAEventTicketPCDPackage
 } from "@pcd/zk-eddsa-event-ticket-pcd";
+import { ZKEdDSAFrogPCDTypeName } from "@pcd/zk-eddsa-frog-pcd";
 import { Api, Bot, InlineKeyboard, RawApi, session } from "grammy";
 import { Chat } from "grammy/types";
 import { sha256 } from "js-sha256";
@@ -52,6 +54,7 @@ import {
   chatsToPostIn,
   encodeTopicData,
   eventsToLink,
+  frogChatsToJoin,
   getBotURL,
   getGroupChat,
   getSessionKey,
@@ -102,6 +105,7 @@ export class TelegramService {
 
     const zupassMenu = new Menu<BotContext>("zupass");
     const eventsMenu = new Menu<BotContext>("events");
+    const frogsMenu = new Menu<BotContext>("frogs");
     const anonSendMenu = new Menu<BotContext>("anonsend");
     const forwardMenu = new Menu<BotContext>("forward");
 
@@ -109,11 +113,14 @@ export class TelegramService {
     // /link and /unlink are unstable right now, pending fixes
     eventsMenu.dynamic(eventsToLink);
     zupassMenu.dynamic(chatsToJoin);
+    frogsMenu.dynamic(frogChatsToJoin);
     anonSendMenu.dynamic(chatsToPostIn);
     forwardMenu.dynamic(chatsToForwardTo);
 
     this.authBot.use(eventsMenu);
     this.authBot.use(zupassMenu);
+    this.authBot.use(frogsMenu);
+
     this.anonBot.use(anonSendMenu);
     this.forwardBot?.use(forwardMenu);
 
@@ -242,6 +249,30 @@ export class TelegramService {
             await ctx.reply(
               `Welcome ${name}! 👋\n\nClick the group you want to join.\n\nYou will sign in to Zupass, then ZK prove you have a ticket for one of the group's events.\n\nSee you soon 😽`,
               { reply_markup: zupassMenu }
+            );
+          }
+        } catch (e) {
+          logger("[TELEGRAM] start error", e);
+          this.rollbarService?.reportError(e);
+        }
+      });
+    });
+
+    // [FrogCrypto] The "croak" command initiates the process of invitation and approval for frog owners.
+    this.authBot.command("croak", async (ctx) => {
+      return traced("telegram", "croak", async (span) => {
+        const userId = ctx?.from?.id;
+        if (userId) span?.setAttribute("userId", userId?.toString());
+        try {
+          // Only process the command if it comes as a private message.
+          if (isDirectMessage(ctx) && userId) {
+            const username = ctx?.from?.username;
+            if (username) span?.setAttribute("username", username);
+            const firstName = ctx?.from?.first_name;
+            const name = firstName || username;
+            await ctx.reply(
+              `Welcome ${name}! 👋\n\nClick the group you want to join.\n\nYou will sign in to Zupass, then ZK prove you have a frog.\n\nSee you soon 😽`,
+              { reply_markup: frogsMenu }
             );
           }
         } catch (e) {
@@ -954,7 +985,7 @@ export class TelegramService {
    * This is called from the /telegram/verify route.
    */
   public async handleVerification(
-    serializedZKEdDSATicket: string,
+    serializedPCD: string,
     telegramUserId: number,
     telegramChatId: string,
     telegramUsername?: string
@@ -962,8 +993,108 @@ export class TelegramService {
     return traced("telegram", "handleVerification", async (span) => {
       span?.setAttribute("userId", telegramUserId.toString());
       // Verify PCD
+      const parsed = JSON.parse(serializedPCD) as SerializedPCD;
+      if (parsed.type == ZKEdDSAFrogPCDTypeName) {
+        await this.handleFrogVerification(
+          serializedPCD,
+          telegramUserId,
+          telegramChatId,
+          telegramUsername
+        );
+        return;
+      }
+
       const pcd = await this.verifyZKEdDSAEventTicketPCD(
-        serializedZKEdDSATicket
+        serializedPCD
+      );
+
+      if (!pcd) {
+        throw new Error(`Could not verify PCD for ${telegramUserId}`);
+      }
+      span?.setAttribute("verifiedPCD", true);
+
+      const { watermark } = pcd.claim;
+
+      if (!watermark) {
+        throw new Error("Verification PCD did not contain watermark");
+      }
+
+      if (telegramUserId.toString() !== watermark.toString()) {
+        throw new Error(
+          `Telegram User id ${telegramUserId} does not match given watermark ${watermark}`
+        );
+      }
+
+      const { attendeeSemaphoreId } = pcd.claim.partialTicket;
+
+      if (!attendeeSemaphoreId) {
+        throw new Error(
+          `User ${telegramUserId} did not reveal their semaphore id`
+        );
+      }
+      span?.setAttribute("semaphoreId", attendeeSemaphoreId);
+
+      const { validEventIds } = pcd.claim;
+      if (!validEventIds) {
+        throw new Error(
+          `User ${telegramUserId} did not submit any valid event ids`
+        );
+      }
+      span?.setAttribute("validEventIds", validEventIds);
+
+      const eventsByChat = await fetchTelegramEventsByChatId(
+        this.context.dbPool,
+        telegramChatId
+      );
+      if (eventsByChat.length == 0)
+        throw new Error(`No valid events found for given chat`);
+      if (!verifyUserEventIds(eventsByChat, validEventIds)) {
+        throw new Error(`User submitted event Ids are invalid `);
+      }
+
+      span?.setAttribute("chatId", telegramChatId);
+
+      const chat = await getGroupChat(this.authBot.api, telegramChatId);
+
+      span?.setAttribute("chatTitle", chat.title);
+
+      logger(
+        `[TELEGRAM] Verified PCD for ${telegramUserId}, chat ${chat}` +
+          (telegramUsername && `, username ${telegramUsername}`)
+      );
+
+      // We've verified that the chat exists, now add the user to our list.
+      // This will be important later when the user requests to join.
+      await insertTelegramVerification(
+        this.context.dbPool,
+        telegramUserId,
+        parseInt(telegramChatId),
+        attendeeSemaphoreId,
+        telegramUsername
+      );
+
+      // Send invite link
+      await this.sendInviteLink(telegramUserId, chat);
+    });
+  }
+
+  /**
+   * [FrogCrypto]
+   * Verify that a PCD relates to a frog.
+   * If so, invite the user to the chat and record them or later approval
+   * when they request to join.
+   */
+  public async handleFrogVerification(
+    serializedPCD: string,
+    telegramUserId: number,
+    telegramChatId: string,
+    telegramUsername?: string
+  ): Promise<void> {
+    return traced("telegram", "handleFrogVerification", async (span) => {
+      span?.setAttribute("userId", telegramUserId.toString());
+      // Verify PCD
+      const pcd = await this.verifyZKEdDSAEventTicketPCD(
+        serializedPCD
       );
 
       if (!pcd) {

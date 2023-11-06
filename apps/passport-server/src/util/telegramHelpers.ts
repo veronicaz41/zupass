@@ -1,4 +1,5 @@
 import { MenuRange } from "@grammyjs/menu";
+import { EdDSAFrogPCDPackage } from "@pcd/eddsa-frog-pcd";
 import { EdDSATicketPCDPackage } from "@pcd/eddsa-ticket-pcd";
 import {
   AnonTopicDataPayload,
@@ -7,12 +8,16 @@ import {
 } from "@pcd/passport-interface";
 import { ArgumentTypeName } from "@pcd/pcd-types";
 import { SemaphoreIdentityPCDPackage } from "@pcd/semaphore-identity-pcd";
-import { ZUPASS_SUPPORT_EMAIL } from "@pcd/util";
+import { ZUPASS_SUPPORT_EMAIL, generateSnarkMessageHash } from "@pcd/util";
 import {
   EdDSATicketFieldsToReveal,
   ZKEdDSAEventTicketPCDArgs,
   ZKEdDSAEventTicketPCDPackage
 } from "@pcd/zk-eddsa-event-ticket-pcd";
+import {
+  ZKEdDSAFrogPCDArgs,
+  ZKEdDSAFrogPCDPackage
+} from "@pcd/zk-eddsa-frog-pcd";
 import { Api, Bot, Context, RawApi, SessionFlavor } from "grammy";
 import {
   BotCommand,
@@ -47,6 +52,12 @@ import {
 } from "../database/queries/telegram/insertTelegramConversation";
 import { traced } from "../services/telemetryService";
 import { logger } from "./logger";
+
+// [FrogCrypto] Hardcoded chat id for the frog owner group
+// TODO: we need to find a better way to configure this
+const TELEGRAM_FROG_OWNERS_CHAT_ID = "-1002128240281"
+const frogExternalNullifier =
+    generateSnarkMessageHash("telegram-frog-owners").toString();
 
 export type TopicChat = Chat.SupergroupChat | null;
 
@@ -100,6 +111,11 @@ const privateChatCommands: BotCommandWithAnon[] = [
     command: "/anonsend",
     description: "Send an anonymous message",
     isAnon: true
+  },
+  {
+    command: "/croak",
+    description: "Join a group with a proof of frog",
+    isAnon: false
   },
   {
     command: "/help",
@@ -432,6 +448,68 @@ const generateTicketProofUrl = async (
   });
 };
 
+// [FrogCrypto]
+const generateFrogProofUrl = async (
+  telegramUserId: string,
+  telegramChatId: string,
+  telegramUsername?: string
+): Promise<string> => {
+  return traced("telegram", "generateFrogProofUrl", async (span) => {
+    span?.setAttribute("userId", telegramUserId);
+
+    const args: ZKEdDSAFrogPCDArgs = {
+      frog: {
+        argumentType: ArgumentTypeName.PCD,
+        pcdType: EdDSAFrogPCDPackage.name,
+        value: undefined,
+        userProvided: true,
+        displayName: "Your Frog",
+        description: "chose a frog",
+        validatorParams: {
+          notFoundMessage: "You don't have a frog."
+        },
+        hideIcon: true
+      },
+      identity: {
+        argumentType: ArgumentTypeName.PCD,
+        pcdType: SemaphoreIdentityPCDPackage.name,
+        value: undefined,
+        userProvided: true
+      },
+      externalNullifier: {
+        argumentType: ArgumentTypeName.BigInt,
+        value: frogExternalNullifier,
+        userProvided: false
+      },
+    };
+
+    let passportOrigin = `${process.env.PASSPORT_CLIENT_URL}/`;
+    if (passportOrigin === "http://localhost:3000/") {
+      // TG bot doesn't like localhost URLs
+      passportOrigin = "http://127.0.0.1:3000/";
+    }
+
+    // pass telegram username as path param if nonempty
+    let returnUrl = `${process.env.PASSPORT_SERVER_URL}/telegram/verify?chatId=${telegramChatId}&userId=${telegramUserId}`;
+    if (telegramUsername && telegramUsername.length > 0)
+      returnUrl += `&username=${telegramUsername}`;
+
+    span?.setAttribute("returnUrl", returnUrl);
+
+    const proofUrl = constructZupassPcdGetRequestUrl<
+      typeof ZKEdDSAFrogPCDPackage
+    >(passportOrigin, returnUrl, ZKEdDSAFrogPCDPackage.name, args, {
+      genericProveScreen: true,
+      title: "",
+      description:
+        "ZuKat requests a zero-knowledge proof of your frog to join a Telegram group."
+    });
+    span?.setAttribute("proofUrl", proofUrl);
+
+    return proofUrl;
+  });
+};
+
 const getChatsWithMembershipStatus = async (
   db: Pool,
   ctx: BotContext,
@@ -580,6 +658,48 @@ export const chatsToJoin = async (
         range.webApp(`${chat.chat?.title}`, proofUrl).row();
       }
     }
+  });
+};
+
+// [FrogCrypto] hardcoded the chat id for now
+export const frogChatsToJoin = async (
+  ctx: BotContext,
+  range: MenuRange<BotContext>
+): Promise<void> => {
+  return traced("telegram", "frogChatToJoin", async (span) => {
+    const userId = ctx.from?.id;
+    if (!userId) {
+      range.text(`User not found. Try again...`);
+      return;
+    }
+    span?.setAttribute("userId", userId?.toString());
+
+    const chat = await getGroupChat(ctx.api, TELEGRAM_FROG_OWNERS_CHAT_ID);
+    span?.setAttribute("chatId", chat.id);
+    span?.setAttribute("chatTitle", chat.title);
+
+    // Check whether the user is already in the chat
+    let member = undefined;
+    try {
+      member = await ctx.api.getChatMember(chat.id, userId);
+    } catch (e) {
+      // The user is not a member of the chat, do nothing
+    }
+
+    // if (member != undefined) {
+    //   const invite = await ctx.api.createChatInviteLink(chat.id, {
+    //     creates_join_request: true
+    //   });
+    //   range.url(`✅ ${chat.title}`, invite.invite_link).row();
+    //   range.row();
+    // } else {
+      const proofUrl = await generateFrogProofUrl(
+        userId.toString(),
+        chat.id.toString(),
+        ctx.from?.username
+      );
+      range.webApp(`${chat.title}`, proofUrl).row();
+    //}
   });
 };
 
