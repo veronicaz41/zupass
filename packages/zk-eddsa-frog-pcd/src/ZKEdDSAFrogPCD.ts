@@ -68,6 +68,8 @@ export type ZKEdDSAFrogPCDArgs = {
   identity: PCDArgument<SemaphoreIdentityPCD>;
 
   externalNullifier: BigIntArgument;
+
+  watermark: BigIntArgument;
 };
 
 /**
@@ -78,6 +80,7 @@ export interface ZKEdDSAFrogPCDClaim {
   signerPublicKey: EdDSAPublicKey;
   externalNullifier: string;
   nullifierHash: string;
+  watermark: string;
 }
 
 /**
@@ -129,7 +132,11 @@ export function getProveDisplayOptions(): ProveDisplayOptions<ZKEdDSAFrogPCDArgs
       externalNullifier: {
         argumentType: ArgumentTypeName.BigInt,
         defaultVisible: false
-      }
+      },
+      watermark: {
+        argumentType: ArgumentTypeName.BigInt,
+        defaultVisible: false
+      },
     }
   };
 }
@@ -155,6 +162,8 @@ async function ensureEddsaInitialized() {
 async function checkProveInputs(args: ZKEdDSAFrogPCDArgs): Promise<{
   frogPCD: EdDSAFrogPCD;
   identityPCD: SemaphoreIdentityPCD;
+  externalNullifier: string;
+  watermark: string;
 }> {
   const serializedFrogPCD = args.frog.value?.pcd;
   if (!serializedFrogPCD) {
@@ -166,11 +175,16 @@ async function checkProveInputs(args: ZKEdDSAFrogPCDArgs): Promise<{
     throw new Error("Cannot make proof: missing identity PCD");
   }
 
-  if (args.externalNullifier.value != undefined &&
-    BigInt(args.externalNullifier.value) === STATIC_SIGNATURE_PCD_NULLIFIER) {
+  const externalNullifier = args.externalNullifier.value ||
+    STATIC_ZK_EDDSA_FROG_PCD_NULLIFIER.toString()
+  if (externalNullifier === STATIC_SIGNATURE_PCD_NULLIFIER.toString()) {
     throw new Error(
       "Cannot make proof: same externalNullifier as SemaphoreSignaturePCD, which would break anonymity"
     );
+  }
+
+  if (!args.watermark.value) {
+    throw new Error("Cannot make proof: missing watermark");
   }
 
   const frogPCD =
@@ -181,14 +195,17 @@ async function checkProveInputs(args: ZKEdDSAFrogPCDArgs): Promise<{
 
   return {
     frogPCD,
-    identityPCD
+    identityPCD,
+    externalNullifier,
+    watermark: args.watermark.value!
   };
 }
 
 function snarkInputForProof(
   frogPCD: EdDSAFrogPCD,
   identityPCD: SemaphoreIdentityPCD,
-  externalNullifer: string
+  externalNullifer: string,
+  watermark: string
 ): Record<string, `${number}` | `${number}`[]> {
   const frogAsBigIntArray = frogDataToBigInts(frogPCD.claim.data);
   const signerPubKey = frogPCD.proof.eddsaPCD.claim.publicKey;
@@ -228,6 +245,7 @@ function snarkInputForProof(
       .toString(),
 
     externalNullifier: externalNullifer,
+    watermark: watermark
   } as Record<string, `${number}` | `${number}`[]>;
 }
 
@@ -256,7 +274,8 @@ function claimFromProofResult(
     frogOmitOwner,
     signerPublicKey: [publicSignals[13], publicSignals[14]],
     externalNullifier: publicSignals[15],
-    nullifierHash: publicSignals[0]
+    watermark: publicSignals[16],
+    nullifierHash: publicSignals[0],
   };
 }
 
@@ -274,15 +293,13 @@ export async function prove(
 
   await ensureEddsaInitialized();
 
-  const { frogPCD, identityPCD } = await checkProveInputs(args);
-
-  const externalNullifier = args.externalNullifier.value?.toString() ||
-    STATIC_ZK_EDDSA_FROG_PCD_NULLIFIER.toString()
+  const { frogPCD, identityPCD, externalNullifier, watermark } = await checkProveInputs(args);
 
   const snarkInput = snarkInputForProof(
     frogPCD,
     identityPCD,
-    externalNullifier
+    externalNullifier,
+    watermark
   )
 
   const { proof, publicSignals } = await groth16Prove(
@@ -325,7 +342,8 @@ export async function verify(pcd: ZKEdDSAFrogPCD): Promise<boolean> {
       "0",
       pcd.claim.signerPublicKey[0],
       pcd.claim.signerPublicKey[1],
-      pcd.claim.externalNullifier
+      pcd.claim.externalNullifier,
+      pcd.claim.watermark
     ];
   return groth16Verify(vkey, { publicSignals, proof: pcd.proof });
 }
