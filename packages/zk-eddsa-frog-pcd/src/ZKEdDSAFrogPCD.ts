@@ -163,7 +163,7 @@ async function checkProveInputs(args: ZKEdDSAFrogPCDArgs): Promise<{
   frogPCD: EdDSAFrogPCD;
   identityPCD: SemaphoreIdentityPCD;
   externalNullifier: string;
-  watermark: string;
+  watermark: bigint;
 }> {
   const serializedFrogPCD = args.frog.value?.pcd;
   if (!serializedFrogPCD) {
@@ -197,7 +197,7 @@ async function checkProveInputs(args: ZKEdDSAFrogPCDArgs): Promise<{
     frogPCD,
     identityPCD,
     externalNullifier,
-    watermark: args.watermark.value!
+    watermark: BigInt(args.watermark.value)
   };
 }
 
@@ -299,7 +299,7 @@ export async function prove(
     frogPCD,
     identityPCD,
     externalNullifier,
-    watermark
+    watermark.toString()
   )
 
   const { proof, publicSignals } = await groth16Prove(
